@@ -1,16 +1,18 @@
 /*This Arduino code is used for the Smart ThermoStat project on the ForceTronics blog http://forcetronic.blogspot.com/ or the Forcetronics Youtube page. 
-This is for part 1 of the project and just implements general thermostat functionality. More advanced fuctions will be added in later versions. 
+This is for part 3 and the only addition was to add an end character or deliminator "^" to the state packet sent by function sendThermoState().
 The project uses the following parts:
 -->Adafruit Trellis keyboard for data entry
 -->18-Bit Color TFT LCD Display
 -->MCP97808 Temperature Sensor
 -->3 Triac switches for controlling the a fan, heater, and air conditioning
+-->HC-06 Bluetooth module
 */
 
 #include "SPI.h" //SPI comm library is used for LCD
 #include "Adafruit_GFX.h" //LCD base library
 #include "Adafruit_ILI9340.h" //LCD library
 #include <Wire.h> //Library used for I2C comm
+#include <ctype.h> //library for isdigit function
 #include "Adafruit_Trellis.h" //keyboard library
 #include "Adafruit_MCP9808.h" //Temp sensor library
 
@@ -38,7 +40,7 @@ float pastTemp = 70.00; //global variable to hold old temp to erase from screen
 float setTemp; //global variable to hold value being created in set mode
 int8_t setState = 0; //used to track if in normal state or set temp state
 int8_t setFunk = 0; //used to track which function (heat or cool) is selected
-int8_t tempTimer = 0; //used to track when 3 seconds has passed to make next temp measurement
+int tempTimer = 0; //used to track when 3 seconds has passed to make next temp measurement
 uint16_t setTimer = 0; //variable used as timer for set mode, when timer ends will exit set mode
 int8_t setTempVal[] = {0, 0, 0}; //array to hold entered temp value
 int8_t pHolder = 0; //keeps track of array position
@@ -47,6 +49,11 @@ int8_t digF = 1; //digital value to control whether fan is on or off, also used 
 int8_t digC = 1; //digital value to control whether cool is on or off, also used to track if cool is on or off
 int8_t digH = 1; //digital value to control whether heat is on or off, also used to track if heat is on or off
 //for the above control signals 1 is off and 0 is on
+int pSaveTimer = 0; //timer variable for putting keypad to sleep (turn off LEDs)
+int8_t BTmode = 0; //bool to track whether there is bluetooth communication taken place or not
+char message[6]; //array to handle messages from bluetooth Android app
+int8_t mCount; //hold length of BT message in array
+int bTTimer = 0;
 
 //setup code that is excuted once when thermo stat is turned on
 void setup() {
@@ -54,6 +61,9 @@ void setup() {
    tft.begin(); //start LCD control object
    tft.setRotation(1); //sets screen orentation
    tft.fillScreen(ILI9340_WHITE); //set the LCD screen background color
+   
+   //Turn on serial connection to communicate bluetooth module
+   Serial.begin(115200);
    
   // Interrupt pin requires a pullup
   pinMode(A2, INPUT);
@@ -82,6 +92,34 @@ void setup() {
 //enter main loop
 void loop() {
   delay(30); //adafruit says 30ms delay is required, dont remove me! **not sure why***
+  
+  if(Serial.available()) { //check if data is available on the serial comm pins
+    if(!BTmode) { //not in bluetooth communication mode, verify code and enter bluetooth mode
+      if(readBTMeassage() && message[0] == '#') { //message was read successfully check to see if # character is there 
+        enterBTMode(); //go into BT mode
+      }
+      else { //message read failed, tell sender
+        sendMessageFail(); 
+      }
+    }
+    else { //we are in bluetooth communication mode so read incoming message from app
+      if(readBTMeassage()) { //if message is available
+        if(message[0] != '*') { //if not end BT session message
+          if(!executeBTMessage()) { 
+            sendMessageFail(); } //send message fail notice to sender
+        }
+        else { //end BT session message
+           exitBTMode();
+        }
+      }
+      else { 
+        sendMessageFail(); } //send message fail notice to sender
+    }
+  }
+  
+   manageBTTimer(); //manage bluetooth timer if connected
+  
+  if(ticPowerSaveTimer() && !BTmode) { //if not in power save mode execute normal code
    if (keyBoard.readSwitches()) { //check to see if any change in key state occurred
      int8_t key = getKeyPress(); //returns the key that was pressed
      if(!setState) { //if we are in normal mode do the following
@@ -91,15 +129,28 @@ void loop() {
        setModeExecute(key);
      }
    }
-   
-   if(setState) {  ticSetTimer(); }//if in set mode, timer for setting temp (30 sec), after which returns to normal mode
-   if(!setState) { getAndControlTemperature(); }//make new temp reading every 3 sec, print it out, and check if need heat or cool
-}
+  }
+ 
+  else if(!BTmode) { //we are entering or in low power mode
+    if (keyBoard.readSwitches()) {
+      pSaveTimer = 0; //reset timer back to 0
+      cycleLEDs(); //cycle LEDs in a pattern before turning them on
+    }
+    else { turnOffLEDs(); }
+  }
+  
+  if(setState) {  ticSetTimer(); }//if in set mode, timer for setting temp (30 sec), after which returns to normal mode
+  if(!setState && !BTmode) { 
+    getAndControlTemperature(); 
+  }//make new temp reading every 3 sec, print it out, and check if need heat or cool 
+
+}//End of Main Loop
 
 //Gets and returns temp every 3 seconds. Checks if heat or cool is on and compares them to current temp. 
 //Activates or deactivatives the heat or AC as needed
 void getAndControlTemperature() {
-  if(tempTimer < 99) { tempTimer++; } //check and tic timer
+  if(tempTimer < 132) { tempTimer++; } //check and tic timer (33.333 times per second is loop speed
+  
   else { //timer is up so measure temp
     if(isFan) { digitalWrite(5, 0); }//turn on fan, if it has been turned on
     else { digitalWrite(5, 1); }//turn off fan
@@ -136,7 +187,13 @@ void getAndControlTemperature() {
         }
       }
     }
-    else { } //can put something here to signal problem in temp reading
+    else {
+      pastTemp = daTemp; //save past temp to be able to erase old value from screen
+      temp = roundFloat(temp); //round to nearest 1/10 or one decimal point
+      daTemp = temp;  //save new temp value to global temp variable
+      eraseTemp(pastTemp); //erase old temp currently displayed
+      printTemp(daTemp); //update thermostat display
+    } //can put something here to signal problem in temp reading
   }
 }
 
@@ -221,7 +278,7 @@ void enterSetState(int8_t tprint) {
    tft.fillScreen(ILI9340_WHITE); //Clear screen
    tft.setTextColor(ILI9340_BLACK); //set text color
    tft.setTextSize(2); //set test size
-   tft.setCursor(0,80); //set cursor for text
+   tft.setCursor(0,120); //set cursor for text
    if(!setFunk) { //if your are setting the heat
      setTemp = heatSet; //temp in set mode is current heat temp 
      tft.print("Set heat, current setting: "); //print set heat string
@@ -326,8 +383,8 @@ void printSetTemp(int8_t val, uint16_t color, int8_t pH) {
   if(pH == 0) { //check if this is the first digit being printed
     eraseTemp(setTemp); //erase currently displayed temp
     tft.setTextColor(color);
-    tft.setCursor(0,5);
-    tft.setTextSize(6);
+    tft.setCursor(20,10);
+    tft.setTextSize(12);
     tft.print(val); //print 10's number value
   }
   else if(pH == 1) {
@@ -412,24 +469,24 @@ void toogleSet() {
 //erases old temp so new one can be printed. Input is past temp value
 void eraseTemp(float temp) {
   tft.setTextColor(ILI9340_WHITE);
-   tft.setCursor(0,5);
-  tft.setTextSize(6);
+   tft.setCursor(20,10);
+  tft.setTextSize(12);
   tft.println(temp,1);
 }
 
 //prints the temp on the screen, input is current temp value
 void printTemp(float temp) {
   tft.setTextColor(ILI9340_BLACK);
-   tft.setCursor(0,5);
-  tft.setTextSize(6);
+   tft.setCursor(20,10);
+  tft.setTextSize(12);
   tft.println(temp,1);
 }
 
 //prints the status of the heat: off or on and what temp set
 void printHeat() {
-  eraseHeatCool(pIsHeat, pastHeat, 80); //erase previous values before print new states
+  eraseHeatCool(pIsHeat, pastHeat, 120); //erase previous values before print new states
   tft.setTextSize(2);
-  tft.setCursor(0,80); //set cursor for list settings
+  tft.setCursor(0,120); //set cursor for list settings
   tft.setTextColor(ILI9340_BLACK); //set text color
   tft.print("Heat:"); //pring heat string
   if(isHeat) { 
@@ -447,9 +504,9 @@ void printHeat() {
 
 //prints the status of the AC: off or on and what temp set
 void printCool() {
-  eraseHeatCool(pIsCool, pastCool, 100); //erase previous values before print new states
+  eraseHeatCool(pIsCool, pastCool, 140); //erase previous values before print new states
   tft.setTextSize(2);
-  tft.setCursor(0,100); //set cursor for list settings
+  tft.setCursor(0,140); //set cursor for list settings
   tft.setTextColor(ILI9340_BLACK); //set text color
   tft.print("Cool:"); //cool string
   if(isCool)  { //if AC is on
@@ -486,7 +543,7 @@ void printFan() {
   eraseFan(); //erase text for old fan setting
   tft.setTextColor(ILI9340_BLACK); //set text color
   tft.setTextSize(2);
-  tft.setCursor(0,120); //set cursor for list settings
+  tft.setCursor(0,160); //set cursor for list settings
   if(isFan)  tft.print("Fan:ON");
   else tft.print("Fan:OFF");
 }
@@ -494,7 +551,7 @@ void printFan() {
 //This is called to erase the current state of the fan so it can be updated
 void eraseFan() {
   tft.setTextSize(2);
-  tft.setCursor(0,120); //set cursor for list settings
+  tft.setCursor(0,160); //set cursor for list settings
   tft.setTextColor(ILI9340_WHITE); //set text color
   if(pIsFan)  tft.print("Fan:ON");
   else tft.print("Fan:OFF");
@@ -502,8 +559,9 @@ void eraseFan() {
 
 //this function gets temp value from sensor and converts it to F
 float getTemp() {
-  float c = tempsensor.readTempC();
-  return (c * 9.0 / 5.0 + 32);
+   float c = tempsensor.readTempC();
+  return ((c * 9.0 / 5.0 + 32)-1);
+  //return (tempsensor.readTempF()-1);
 }
 
 //toggles the state of a bool variable
@@ -560,11 +618,209 @@ void turnOnLEDs() {
  }
 }
 
+//turn off all LEDs on keyboard
+void turnOffLEDs() {
+ for(int i=0; i<16; i++) {
+   keyBoard.clrLED(i); //clear lit LED
+   keyBoard.writeDisplay(); //write on state
+ }
+}
+
 //when button is pressed toogle the LED off briefly then back on
 void toggleLED(int8_t i) {
   keyBoard.clrLED(i); //clear lit LED
   keyBoard.writeDisplay(); //write off state
-  delay(150);
+  delay(120);
   keyBoard.setLED(i); //turn LED on
   keyBoard.writeDisplay(); //write on state
+}
+
+//Runs a light up pattern for key pad LEDs for when power save mode is exited
+void cycleLEDs() {
+  for(int i=0; i<16; i++) {
+   keyBoard.setLED(i); //turn LED on
+   keyBoard.writeDisplay(); //write on state
+   delay(30);
+   keyBoard.clrLED(i); //clear lit LED
+   keyBoard.writeDisplay(); //write off state
+ }
+ for(int i=0; i<16; i++) {
+   keyBoard.setLED(15-i); //turn LED on
+   keyBoard.writeDisplay(); //write on state
+   delay(30);
+   keyBoard.clrLED(15-i); //clear lit LED
+   keyBoard.writeDisplay(); //write off state
+ }
+ for(int i=0; i<16; i++) {
+   keyBoard.setLED(i); //turn LED on
+   keyBoard.writeDisplay(); //write on state
+   delay(30);
+ }
+}
+
+//timer function for power save. After 10 min this will signal to turn off keypad LEDs
+int8_t ticPowerSaveTimer() {
+  if(pSaveTimer < 4999) {
+    pSaveTimer++;
+    return 1; 
+  }
+  else { return 0; }
+}
+
+//reads incoming message from bluetooth device and determines if it is valid and stores it in message array
+int8_t readBTMeassage() {
+  int8_t mEnd = 0; //track to see if we reached end of the message. only if we reach end will we report success on message recieve
+  mCount = 0; //track array position and message length
+  if(Serial.available()) {
+    char p = (char)Serial.read();
+    if(p == '@') {
+      while(Serial.available()) {
+        p = (char)Serial.read();
+        if(p != '&') { //if this is not the end character store it in message
+          message[mCount] = p;
+          mCount++;
+          if(mCount > 5) { //if count gets larger than 5 something is wrong and there is no end character so break
+            break; 
+          }
+        }
+        else { 
+        mEnd = 1; //reached end of message
+        break; } //made it to end character so break out of loop
+      }
+    }   
+  }
+ 
+ clearSerialBuffer(); //in case buffer is not cleared
+ if(mEnd && mCount > 0) { return 1; }//if we reached the end char and the message is not empty report success
+ else { return 0; }
+ 
+}
+
+//sends current state of thermo stat over Serial to bluetooth connected device
+void sendThermoState() {
+  sendTemp('t', daTemp); //send the current temp
+  delay(10);
+  sendTemp('h', heatSet); //send the heat set temp
+  delay(10);
+  sendTemp('c', coolSet); //send the heat set temp
+  delay(10); 
+  sendHCFState('h', isHeat); //send if heat is on or off
+   delay(10); 
+  sendHCFState('c', isCool); //send if cool is on or off
+   delay(10); 
+  sendHCFState('f', isFan); //send if fan is on or off
+  delay(10);
+  Serial.print('^'); //send delimiter or end character for state of thermostat
+}
+
+//function to build states of fan, cool, heat for sending to bluetooth device
+void sendHCFState(char s, int8_t state) {
+  Serial.print('@'); //start char
+  Serial.print(s); //code letter for heat or cool or fan
+  Serial.print(state); //send state
+  Serial.print('&'); //send end char 
+}
+
+//function to create temp value messages for sending to bluetooth device
+void sendTemp(char s, float temp) {
+ Serial.print('@'); //start char
+ Serial.print(s); //code letter for temp, heat, or cool
+ Serial.print(temp); //send temp
+ Serial.print('&'); //send end char 
+}
+
+//This function executes the command in the message array from the bluetooth device. If success it returns a 1 if fail returns 0
+//If successful it resets bluetooth timer
+int8_t executeBTMessage() {
+  
+  if(mCount > 2 && isdigit(message[1]) && isdigit(message[2]) && isdigit(message[4])) { //check if it is a temp set message
+    float tempVal; //local variable to hold incoming temp value
+    if(message[0] == 'h') { //heat temp setting
+      tempVal = convertToFloat((int)message[1]-'0', (int)message[2]-'0', (int)message[4]-'0');
+      if(checkTempRange(tempVal)) { //check temp value to make sure it is in acceptable range
+        heatSet = tempVal; //temp value is good so set global
+        printHeat(); //set heat value has changed so print new one out
+        pastHeat = heatSet; //set past heat value
+      }
+      else { return 0; } //temp value sent is not valid, return fail
+    }
+    else if(message[0] == 'c') { //cool temp setting
+      tempVal = convertToFloat(message[1]-'0', (int)message[2]-'0', (int)message[4]-'0');
+      if(checkTempRange(tempVal)) { //check temp value to make sure it is in acceptable range
+        coolSet = tempVal; //temp value is good so set global
+        printCool(); //set cool value has changed so print new one out
+        pastCool = coolSet; //set past cool value
+      }
+      else { return 0; } //temp value sent is not valid, return fail
+    }
+    else { return 0; } //something was wrong with the message
+  }
+  else if (mCount == 2 && isdigit(message[1])) { //it is a turn fan / heat / cool on or off
+    if(message[0] == 'h') { //turn heat on or off
+      isHeat = (int)message[1]-'0'; 
+      printHeat(); //print new heat state
+    }
+    else if(message[0] == 'c') { //turn cool on or off
+      isCool = (int)message[1]-'0'; 
+      printCool(); //print new cool state
+    }
+    else if(message[0] == 'f') { //turn fan on or off
+       pIsFan = isFan; //capture the previous state of the fan
+      isFan = (int)message[1]-'0'; 
+      printFan(); //call function to change screen state 
+    }
+    else { return 0; } //something went wrong, return fail
+  }
+  else { return 0; } //something was wrong, return fail
+  
+  bTTimer = 0; //Just read a successful message so reset the timer
+  return 1; //return that message was success
+}
+
+//This function converts three ints to a float temp value
+float convertToFloat(int ten, int one, int tenth) {
+  return ((float)ten*10) + ((float)one) + ((float)tenth/10);
+}
+
+//Clears serial buffer
+void clearSerialBuffer() {
+  while(Serial.available()) {
+    Serial.read();
+  }
+}
+
+//send failure message
+void sendMessageFail() {
+ Serial.print("@mf&"); //start char
+}
+
+//actions to execute when entering bluetooth mode: set bool, change display, and send current state
+void enterBTMode () {
+  BTmode = 1; //enter BT communication mode
+  tft.setTextColor(ILI9340_BLACK); //set text color
+  tft.setTextSize(2);
+  tft.setCursor(0,180); //set cursor for list settings
+  tft.print("Bluetooth Comm Mode");
+  sendThermoState(); //send the current state of the thermo stat 
+}
+
+//actions to execute when exiting bluetooth mode: set bool, reset timer, send end message, change display, and send current state
+void exitBTMode () {
+  BTmode = 0; //enter BT communication mode
+  bTTimer = 0; //set bluetooth timer back to zero
+   Serial.print("@*&"); //tell the android device that we are exiting BT mode
+  tft.setTextColor(ILI9340_WHITE); //set text color
+  tft.setTextSize(2);
+  tft.setCursor(0,180); //set cursor for list settings
+  tft.print("Bluetooth Comm Mode");
+}
+
+//this function tracks and tics timer for BT. If timer goes off exit bluetooth mode
+void manageBTTimer() {
+  if(BTmode) { //if in bluetooth mode 
+    bTTimer++; //tic timer
+    if(bTTimer > 2500) {
+      exitBTMode(); //exit bluetooth mode
+    }
+  }
 }
